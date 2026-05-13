@@ -19,7 +19,7 @@ from trl import DPOConfig as HfDPOConfig
 from trl import GRPOConfig as HfGRPOConfig
 from trl import KTOConfig as HfKTOConfig
 from trl import RewardConfig as HfRewardConfig
-from typing import Optional
+from typing import List, Literal, Optional
 
 from swift.trainers import TrainArgumentsMixin
 from .args_mixin import GRPOArgumentsMixin, RolloutTrainerArgumentsMixin
@@ -81,6 +81,17 @@ class PPOConfig(TrainArgumentsMixin, HfPPOConfig):
 @dataclass
 class GKDConfig(RolloutTrainerArgumentsMixin, TrainArgumentsMixin, HfGKDConfig):
     sft_alpha: float = 0
+
+    mopd_enable: bool = False
+    mopd_teacher_servers: Optional[str] = None
+    mopd_teacher_heads: Optional[str] = None
+    mopd_teacher_id_column: str = 'teacher_id'
+    mopd_teacher_weights: Optional[List[str]] = None
+    mopd_task_column: str = 'task'
+    mopd_default_task: str = 'codegen'
+    mopd_hidden_dtype: Literal['bf16', 'fp16', 'fp32'] = 'bf16'
+    mopd_request_timeout: float = 300.
+    mopd_loss_chunk_size: int = 512
 
     offload_teacher_model: bool = False
     max_completion_length: int = 512

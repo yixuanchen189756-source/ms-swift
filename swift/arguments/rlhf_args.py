@@ -221,6 +221,23 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             If set to a positive integer, only top-k teacher logits are used (more efficient).
             When using `teacher_model_server`, this is limited by the server's `max_logprobs` setting
             (vLLM default is 20, can be increased with `--max-logprobs`). Defaults to None.
+        mopd_enable (bool): Whether to enable multi-teacher OPD with remote teacher hidden states and local teacher
+            lm heads. Defaults to False.
+        mopd_teacher_servers (Optional[str]): Comma-separated teacher server mapping, for example
+            `math=http://host1:8000,code=http://host2:8000`. Required when `mopd_enable` is True.
+        mopd_teacher_heads (Optional[str]): Comma-separated teacher lm head mapping, for example
+            `math=/path/math_model,code=/path/code_head`. Keys must match `mopd_teacher_servers`.
+        mopd_teacher_id_column (str): Dataset column used to choose the teacher per sample. Defaults to `teacher_id`.
+        mopd_teacher_weights (Optional[List[str]]): Task-specific teacher mixture weights, for example
+            `codegen=codegen:0.75,reasoning:0.05,agent:0.20`. When omitted, defaults for reasoning/codegen/agent
+            are used.
+        mopd_task_column (str): Dataset column used to choose the task weight profile. Defaults to `task`.
+        mopd_default_task (str): Task weight profile used when a sample has no task column. Defaults to `codegen`.
+        mopd_hidden_dtype (Literal['bf16', 'fp16', 'fp32']): Requested dtype for hidden-state transport.
+            Defaults to `bf16`.
+        mopd_request_timeout (float): Timeout in seconds for remote hidden-state requests. Defaults to 300.
+        mopd_loss_chunk_size (int): Token chunk size used when materializing teacher full-vocab logits from hidden
+            states and lm heads. Defaults to 512.
         offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
             training. Defaults to False.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
@@ -259,6 +276,16 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     lmbda: float = 0.5
     seq_kd: bool = False
     gkd_logits_topk: Optional[int] = None
+    mopd_enable: bool = False
+    mopd_teacher_servers: Optional[str] = None
+    mopd_teacher_heads: Optional[str] = None
+    mopd_teacher_id_column: str = 'teacher_id'
+    mopd_teacher_weights: Optional[List[str]] = None
+    mopd_task_column: str = 'task'
+    mopd_default_task: str = 'codegen'
+    mopd_hidden_dtype: Literal['bf16', 'fp16', 'fp32'] = 'bf16'
+    mopd_request_timeout: float = 300.
+    mopd_loss_chunk_size: int = 512
     offload_teacher_model: bool = False
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
@@ -461,7 +488,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     def _set_default(self):
         if self.beta is None:
-            if self.rlhf_type == 'gkd':
+            if self.rlhf_type == 'gkd' and self.mopd_enable:
+                self.beta = 1.
+            elif self.rlhf_type == 'gkd':
                 self.beta = 0.5
             else:
                 self.beta = 0.1
@@ -577,6 +606,10 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
 
+        if self.mopd_enable:
+            self._check_mopd()
+            return
+
         if self.teacher_model is not None and self.teacher_model_server is not None:
             raise ValueError('GKD requires either `teacher_model` or `teacher_model_server` to be set, not both.')
 
@@ -615,3 +648,122 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.teacher_model_server and self.seq_kd:
             raise NotImplementedError('Sequential KD is not supported when using teacher_model_server')
+
+    @staticmethod
+    def _parse_mopd_mapping(value: Optional[str], arg_name: str) -> Dict[str, str]:
+        if not value:
+            raise ValueError(f'{arg_name} is required when `mopd_enable` is true.')
+        mapping = {}
+        for item in str(value).split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if '=' not in item:
+                raise ValueError(f'{arg_name} entries must use `name=value` format, got: {item}')
+            name, mapped_value = item.split('=', 1)
+            name = name.strip()
+            mapped_value = mapped_value.strip()
+            if not name or not mapped_value:
+                raise ValueError(f'{arg_name} entries must use non-empty `name=value` format, got: {item}')
+            if name in mapping:
+                raise ValueError(f'Duplicate teacher id `{name}` in {arg_name}.')
+            mapping[name] = mapped_value
+        if not mapping:
+            raise ValueError(f'{arg_name} is required when `mopd_enable` is true.')
+        return mapping
+
+    @staticmethod
+    def _default_mopd_teacher_weights() -> Dict[str, Dict[str, float]]:
+        return {
+            'reasoning': {
+                'reasoning': 0.75,
+                'codegen': 0.05,
+                'agent': 0.20
+            },
+            'codegen': {
+                'codegen': 0.75,
+                'reasoning': 0.05,
+                'agent': 0.20
+            },
+            'agent': {
+                'agent': 0.75,
+                'reasoning': 0.05,
+                'codegen': 0.20
+            },
+        }
+
+    @classmethod
+    def _parse_mopd_teacher_weights(cls, value: Optional[List[str]]) -> Dict[str, Dict[str, float]]:
+        if value is None:
+            return cls._default_mopd_teacher_weights()
+        if isinstance(value, str):
+            entries = [part for part in value.split(';') if part.strip()]
+        else:
+            entries = []
+            for item in value:
+                entries.extend(part for part in str(item).split(';') if part.strip())
+
+        weights = {}
+        for entry in entries:
+            if '=' not in entry:
+                raise ValueError(f'mopd_teacher_weights entries must use `task=teacher:weight,...`, got: {entry}')
+            task, teacher_values = entry.split('=', 1)
+            task = task.strip()
+            if not task:
+                raise ValueError(f'mopd_teacher_weights task name must be non-empty, got: {entry}')
+            if task in weights:
+                raise ValueError(f'Duplicate task `{task}` in mopd_teacher_weights.')
+            task_weights = {}
+            for pair in teacher_values.split(','):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if ':' not in pair:
+                    raise ValueError(f'mopd_teacher_weights teacher entries must use `teacher:weight`, got: {pair}')
+                teacher_id, weight = pair.split(':', 1)
+                teacher_id = teacher_id.strip()
+                if not teacher_id:
+                    raise ValueError(f'mopd_teacher_weights teacher id must be non-empty, got: {pair}')
+                if teacher_id in task_weights:
+                    raise ValueError(f'Duplicate teacher `{teacher_id}` in task `{task}`.')
+                weight = float(weight)
+                if weight <= 0:
+                    raise ValueError(f'mopd_teacher_weights must be positive, got {weight} for `{teacher_id}`.')
+                task_weights[teacher_id] = weight
+            total = sum(task_weights.values())
+            if total <= 0:
+                raise ValueError(f'mopd_teacher_weights for task `{task}` must contain at least one positive weight.')
+            weights[task] = {teacher_id: weight / total for teacher_id, weight in task_weights.items()}
+        if not weights:
+            raise ValueError('mopd_teacher_weights must not be empty when provided.')
+        return weights
+
+    def _check_mopd(self):
+        if self.teacher_model is not None or self.teacher_model_server is not None:
+            raise ValueError('MOPD uses `mopd_teacher_servers` and `mopd_teacher_heads`; do not set '
+                             '`teacher_model` or `teacher_model_server`.')
+        if self.seq_kd:
+            raise NotImplementedError('Sequential KD is not supported with MOPD remote hidden-state teachers.')
+        if self.gkd_logits_topk is not None:
+            raise ValueError('MOPD is a full-vocabulary distillation path; do not set `gkd_logits_topk`.')
+        if self.use_liger_kernel:
+            raise ValueError('MOPD is not supported with liger kernel GKD loss.')
+        if self.padding_free or self.packing:
+            raise NotImplementedError('MOPD currently does not support padding_free or packing.')
+        if self.mopd_loss_chunk_size <= 0:
+            raise ValueError(f'mopd_loss_chunk_size must be positive, got {self.mopd_loss_chunk_size}.')
+
+        servers = self._parse_mopd_mapping(self.mopd_teacher_servers, 'mopd_teacher_servers')
+        heads = self._parse_mopd_mapping(self.mopd_teacher_heads, 'mopd_teacher_heads')
+        if set(servers) != set(heads):
+            raise ValueError('MOPD teacher ids must match between `mopd_teacher_servers` and `mopd_teacher_heads`. '
+                             f'servers={sorted(servers)}, heads={sorted(heads)}')
+        teacher_weights = self._parse_mopd_teacher_weights(self.mopd_teacher_weights)
+        for task, task_weights in teacher_weights.items():
+            unknown_teachers = set(task_weights) - set(servers)
+            if unknown_teachers:
+                raise ValueError(f'MOPD task `{task}` references unknown teacher ids: {sorted(unknown_teachers)}. '
+                                 f'Available teachers: {sorted(servers)}')
+        if self.mopd_default_task not in teacher_weights:
+            raise ValueError(f'mopd_default_task `{self.mopd_default_task}` is not defined in mopd_teacher_weights. '
+                             f'Available tasks: {sorted(teacher_weights)}')

@@ -33,6 +33,9 @@ class RowPreprocessor:
                                 'channel',
                                 'margin',
                                 'teacher_prompt',
+                                'task',
+                                'teacher_id',
+                                'teacher_name',
                                 'chat_template_kwargs',
                             ]
 

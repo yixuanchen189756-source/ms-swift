@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import io
+import json
 import os
 import random
 import re
@@ -17,7 +19,7 @@ from packaging import version
 from transformers import PreTrainedModel
 from trl import SFTTrainer as HFSFTTrainer
 from trl.trainer.utils import RepeatSampler
-from typing import Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from swift.infer_engine.protocol import MultiModalRequestMixin
 from swift.template import TemplateInputs
@@ -58,21 +60,28 @@ class DataSource(str, Enum):
 @dataclass
 class TeacherOutput:
     """Unified container for teacher model outputs from all three sources:
-    local full-vocab, local top-k, and external API top-k.
+    local full-vocab, local top-k, external API top-k, and MOPD hidden states.
     """
     full_logits: Optional[torch.Tensor] = None
     topk_logprobs: Optional[torch.Tensor] = None
     topk_indices: Optional[torch.Tensor] = None
+    hidden_states: Optional[Any] = None
+    teacher_ids: Optional[List[str]] = None
+    teacher_weights: Optional[List[Dict[str, float]]] = None
     opsd_teacher_labels: Optional[torch.Tensor] = None
 
     @property
     def is_topk_mode(self) -> bool:
         return self.topk_logprobs is not None and self.topk_indices is not None
 
+    @property
+    def is_hidden_state_mode(self) -> bool:
+        return self.hidden_states is not None and (self.teacher_ids is not None or self.teacher_weights is not None)
+
     def validate(self):
-        if self.full_logits is None and not self.is_topk_mode:
+        if self.full_logits is None and not self.is_topk_mode and not self.is_hidden_state_mode:
             raise ValueError('TeacherOutput must provide either full_logits or '
-                             '(topk_logprobs, topk_indices). Got neither.')
+                             '(topk_logprobs, topk_indices) or (hidden_states, teacher_ids). Got neither.')
 
 
 teacher_model_server_model_name = None
@@ -100,6 +109,19 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         self.teacher_model_server = teacher_model_server
         self.use_teacher_api = teacher_model_server is not None
+        self.mopd_enable = getattr(args, 'mopd_enable', False)
+        self.mopd_teacher_id_column = getattr(args, 'mopd_teacher_id_column', 'teacher_id')
+        self.mopd_task_column = getattr(args, 'mopd_task_column', 'task')
+        self.mopd_default_task = getattr(args, 'mopd_default_task', 'codegen')
+        self.mopd_hidden_dtype = getattr(args, 'mopd_hidden_dtype', 'bf16')
+        self.mopd_request_timeout = getattr(args, 'mopd_request_timeout', 300.)
+        self.mopd_loss_chunk_size = getattr(args, 'mopd_loss_chunk_size', 512)
+        self.mopd_teacher_servers = self._parse_mopd_mapping(
+            getattr(args, 'mopd_teacher_servers', None), required=self.mopd_enable)
+        self.mopd_teacher_head_paths = self._parse_mopd_mapping(
+            getattr(args, 'mopd_teacher_heads', None), required=self.mopd_enable)
+        self.mopd_teacher_weights = self._parse_mopd_teacher_weights(getattr(args, 'mopd_teacher_weights', None))
+        self._mopd_head_tensors: Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
 
         # Initialize logging components
         self._prepare_logging()
@@ -110,7 +132,11 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.teacher_ds3_gather_for_generation = args.ds3_gather_for_generation
         self.is_teacher_ds3 = None
         self._teacher_use_disable_adapter = teacher_use_disable_adapter
-        self._is_self_distillation = (teacher_model is None and teacher_model_server is None)
+        self._is_self_distillation = (teacher_model is None and teacher_model_server is None and not self.mopd_enable)
+
+        if self.mopd_enable:
+            logger.info(f'Using MOPD hidden-state teachers: {sorted(self.mopd_teacher_servers)}')
+            self._prepare_mopd_teacher_heads()
 
         # Initialize teacher model
         if teacher_model is not None:
@@ -189,6 +215,293 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             teacher_item['messages'] = messages
             teacher_data.append(teacher_item)
         return teacher_data
+
+    @staticmethod
+    def _parse_mopd_mapping(value, required: bool = False) -> Dict[str, str]:
+        if value is None or value == '':
+            if required:
+                raise ValueError('MOPD teacher mapping is required when `mopd_enable` is true.')
+            return {}
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, (list, tuple)):
+            items = []
+            for part in value:
+                items.extend(str(part).split(','))
+        else:
+            items = str(value).split(',')
+
+        mapping = {}
+        for item in items:
+            if isinstance(item, tuple):
+                name, mapped_value = item
+            else:
+                item = item.strip()
+                if not item:
+                    continue
+                if '=' not in item:
+                    raise ValueError(f'MOPD mapping entries must use `name=value` format, got: {item}')
+                name, mapped_value = item.split('=', 1)
+            name = str(name).strip()
+            mapped_value = str(mapped_value).strip()
+            if not name or not mapped_value:
+                raise ValueError('MOPD mapping entries must have non-empty teacher ids and values.')
+            if name in mapping:
+                raise ValueError(f'Duplicate MOPD teacher id: {name}')
+            mapping[name] = mapped_value
+        if required and not mapping:
+            raise ValueError('MOPD teacher mapping is required when `mopd_enable` is true.')
+        return mapping
+
+    @staticmethod
+    def _default_mopd_teacher_weights() -> Dict[str, Dict[str, float]]:
+        return {
+            'reasoning': {
+                'reasoning': 0.75,
+                'codegen': 0.05,
+                'agent': 0.20
+            },
+            'codegen': {
+                'codegen': 0.75,
+                'reasoning': 0.05,
+                'agent': 0.20
+            },
+            'agent': {
+                'agent': 0.75,
+                'reasoning': 0.05,
+                'codegen': 0.20
+            },
+        }
+
+    @classmethod
+    def _parse_mopd_teacher_weights(cls, value) -> Dict[str, Dict[str, float]]:
+        if value is None:
+            return cls._default_mopd_teacher_weights()
+        if isinstance(value, str):
+            entries = [part for part in value.split(';') if part.strip()]
+        else:
+            entries = []
+            for item in value:
+                entries.extend(part for part in str(item).split(';') if part.strip())
+
+        weights = {}
+        for entry in entries:
+            if '=' not in entry:
+                raise ValueError(f'MOPD teacher weights must use `task=teacher:weight,...`, got: {entry}')
+            task, teacher_values = entry.split('=', 1)
+            task = task.strip()
+            if not task:
+                raise ValueError(f'MOPD teacher weight task must be non-empty, got: {entry}')
+            if task in weights:
+                raise ValueError(f'Duplicate MOPD task `{task}` in teacher weights.')
+            task_weights = {}
+            for pair in teacher_values.split(','):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if ':' not in pair:
+                    raise ValueError(f'MOPD teacher weight entry must use `teacher:weight`, got: {pair}')
+                teacher_id, weight = pair.split(':', 1)
+                teacher_id = teacher_id.strip()
+                if not teacher_id:
+                    raise ValueError(f'MOPD teacher id must be non-empty, got: {pair}')
+                if teacher_id in task_weights:
+                    raise ValueError(f'Duplicate MOPD teacher `{teacher_id}` in task `{task}`.')
+                weight = float(weight)
+                if weight <= 0:
+                    raise ValueError(f'MOPD teacher weight must be positive, got {weight} for `{teacher_id}`.')
+                task_weights[teacher_id] = weight
+            total = sum(task_weights.values())
+            if total <= 0:
+                raise ValueError(f'MOPD task `{task}` must contain at least one positive teacher weight.')
+            weights[task] = {teacher_id: weight / total for teacher_id, weight in task_weights.items()}
+        if not weights:
+            raise ValueError('MOPD teacher weights must not be empty when provided.')
+        return weights
+
+    @staticmethod
+    def _mopd_dtype(dtype_name: str) -> torch.dtype:
+        dtype_mapping = {
+            'bf16': torch.bfloat16,
+            'bfloat16': torch.bfloat16,
+            'fp16': torch.float16,
+            'float16': torch.float16,
+            'fp32': torch.float32,
+            'float32': torch.float32,
+        }
+        if dtype_name not in dtype_mapping:
+            raise ValueError(f'Unsupported MOPD hidden dtype: {dtype_name}')
+        return dtype_mapping[dtype_name]
+
+    @staticmethod
+    def _is_lm_head_weight_key(key: str) -> bool:
+        exact_keys = {
+            'lm_head.weight',
+            'output_layer.weight',
+            'language_model.output_layer.weight',
+            'model.output_layer.weight',
+            'model.lm_head.weight',
+            'decoder.output_projection.weight',
+        }
+        tied_embedding_keys = {
+            'model.embed_tokens.weight',
+            'model.language_model.embed_tokens.weight',
+            'language_model.embed_tokens.weight',
+            'transformer.wte.weight',
+            'language_model.embedding.word_embeddings.weight',
+        }
+        suffixes = ('.lm_head.weight', '.output_layer.weight', '.output_projection.weight')
+        return key in exact_keys or key in tied_embedding_keys or key.endswith(suffixes)
+
+    @staticmethod
+    def _select_lm_head_key(keys) -> Optional[str]:
+        for key in (
+                'lm_head.weight',
+                'output_layer.weight',
+                'language_model.output_layer.weight',
+                'model.output_layer.weight',
+                'model.lm_head.weight',
+                'decoder.output_projection.weight',
+        ):
+            if key in keys:
+                return key
+        for key in keys:
+            if GKDTrainer._is_lm_head_weight_key(key):
+                return key
+        for key in ('model.embed_tokens.weight', 'model.language_model.embed_tokens.weight',
+                    'language_model.embed_tokens.weight', 'transformer.wte.weight',
+                    'language_model.embedding.word_embeddings.weight'):
+            if key in keys:
+                return key
+        return None
+
+    @staticmethod
+    def _checkpoint_files(path: str, preferred_files: Optional[List[str]] = None) -> List[str]:
+        if os.path.isfile(path):
+            return [path]
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f'MOPD teacher head path does not exist: {path}')
+
+        files = []
+        if preferred_files:
+            for file_name in preferred_files:
+                file_path = os.path.join(path, file_name)
+                if os.path.isfile(file_path) and file_path not in files:
+                    files.append(file_path)
+
+        for file_name in sorted(os.listdir(path)):
+            if file_name.endswith(('.safetensors', '.bin', '.pt', '.pth')):
+                file_path = os.path.join(path, file_name)
+                if file_path not in files:
+                    files.append(file_path)
+        return files
+
+    @staticmethod
+    def _load_tensors_from_file(file_path: str) -> Dict[str, torch.Tensor]:
+        if file_path.endswith('.safetensors'):
+            try:
+                from safetensors.torch import safe_open
+            except ImportError as e:
+                raise ImportError('Loading MOPD teacher heads from safetensors requires `safetensors`.') from e
+            tensors = {}
+            with safe_open(file_path, framework='pt', device='cpu') as f:
+                for key in f.keys():
+                    if GKDTrainer._is_lm_head_weight_key(key) or key.endswith('.bias') or key == 'lm_head.bias':
+                        tensors[key] = f.get_tensor(key)
+            return tensors
+
+        try:
+            state = torch.load(file_path, map_location='cpu', weights_only=True)
+        except TypeError:
+            state = torch.load(file_path, map_location='cpu')
+        if isinstance(state, dict):
+            if 'state_dict' in state and isinstance(state['state_dict'], dict):
+                state = state['state_dict']
+            elif 'model' in state and isinstance(state['model'], dict):
+                state = state['model']
+        if not isinstance(state, dict):
+            raise ValueError(f'Unsupported checkpoint format for MOPD teacher head: {file_path}')
+        return {k: v for k, v in state.items() if isinstance(v, torch.Tensor)}
+
+    @classmethod
+    def _load_lm_head_tensors(cls, path: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        preferred_files = None
+        if os.path.isdir(path):
+            for index_name in ('model.safetensors.index.json', 'pytorch_model.bin.index.json'):
+                index_path = os.path.join(path, index_name)
+                if not os.path.isfile(index_path):
+                    continue
+                with open(index_path, encoding='utf-8') as f:
+                    weight_map = json.load(f).get('weight_map', {})
+                weight_key = cls._select_lm_head_key(weight_map.keys())
+                if weight_key is not None:
+                    bias_key = weight_key[:-len('.weight')] + '.bias'
+                    preferred_files = [weight_map[weight_key]]
+                    if bias_key in weight_map:
+                        preferred_files.append(weight_map[bias_key])
+                    break
+
+        for file_path in cls._checkpoint_files(path, preferred_files):
+            tensors = cls._load_tensors_from_file(file_path)
+            weight_key = cls._select_lm_head_key(tensors.keys())
+            if weight_key is None:
+                continue
+            weight = tensors[weight_key].detach().cpu().contiguous()
+            if weight.ndim != 2:
+                raise ValueError(f'MOPD lm head weight must be rank-2, got {tuple(weight.shape)} from {file_path}')
+            bias_key = weight_key[:-len('.weight')] + '.bias'
+            bias = tensors.get(bias_key)
+            if bias is not None:
+                bias = bias.detach().cpu().contiguous()
+                if bias.ndim != 1 or bias.shape[0] != weight.shape[0]:
+                    raise ValueError(f'MOPD lm head bias shape {tuple(bias.shape)} does not match weight '
+                                     f'{tuple(weight.shape)} from {file_path}')
+            return weight, bias
+        raise ValueError(f'Could not find an lm head weight in MOPD teacher head path: {path}')
+
+    def _prepare_mopd_teacher_heads(self):
+        if set(self.mopd_teacher_servers) != set(self.mopd_teacher_head_paths):
+            raise ValueError('MOPD teacher ids must match between servers and heads. '
+                             f'servers={sorted(self.mopd_teacher_servers)}, '
+                             f'heads={sorted(self.mopd_teacher_head_paths)}')
+        for task, task_weights in self.mopd_teacher_weights.items():
+            unknown_teachers = set(task_weights) - set(self.mopd_teacher_servers)
+            if unknown_teachers:
+                raise ValueError(f'MOPD task `{task}` references unknown teacher ids: {sorted(unknown_teachers)}. '
+                                 f'Available teachers: {sorted(self.mopd_teacher_servers)}')
+        if self.mopd_default_task not in self.mopd_teacher_weights:
+            raise ValueError(f'MOPD default task `{self.mopd_default_task}` is not defined. '
+                             f'Available tasks: {sorted(self.mopd_teacher_weights)}')
+        for teacher_id, head_path in self.mopd_teacher_head_paths.items():
+            weight, bias = self._load_lm_head_tensors(head_path)
+            weight.requires_grad_(False)
+            if bias is not None:
+                bias.requires_grad_(False)
+            self._mopd_head_tensors[teacher_id] = (weight, bias)
+            logger.info(f'Loaded MOPD lm head `{teacher_id}` from {head_path}: '
+                        f'weight_shape={tuple(weight.shape)}, dtype={weight.dtype}')
+
+    def _get_mopd_sample_teacher_weights(self, raw_inputs: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        sample_teacher_weights = []
+        for idx, data in enumerate(raw_inputs):
+            teacher_id = data.get(self.mopd_teacher_id_column)
+            if teacher_id is None and self.mopd_teacher_id_column == 'teacher_id':
+                teacher_id = data.get('teacher_name')
+            if teacher_id is not None:
+                teacher_id = str(teacher_id)
+                if teacher_id not in self.mopd_teacher_servers:
+                    raise ValueError(f'Unknown MOPD teacher id `{teacher_id}`. '
+                                     f'Available teachers: {sorted(self.mopd_teacher_servers)}')
+                sample_teacher_weights.append({teacher_id: 1.0})
+                continue
+
+            task = data.get(self.mopd_task_column, self.mopd_default_task)
+            task = self.mopd_default_task if task is None or task == '' else str(task)
+            if task not in self.mopd_teacher_weights:
+                raise ValueError(f'Unknown MOPD task `{task}` at batch index {idx}. '
+                                 f'Available tasks: {sorted(self.mopd_teacher_weights)}')
+            sample_teacher_weights.append(dict(self.mopd_teacher_weights[task]))
+        return sample_teacher_weights
 
     def _compute_jsd_loss(self, student_logits, teacher_output: TeacherOutput, labels):
         """Compute JSD loss using unified TeacherOutput.
@@ -308,6 +621,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         # Get teacher logprobs from API if available (set in training_step)
         teacher_api_logprobs = inputs.pop('_teacher_api_logprobs', None)
         teacher_api_indices = inputs.pop('_teacher_api_indices', None)
+        mopd_teacher_hidden_states = inputs.pop('_mopd_teacher_hidden_states', None)
+        mopd_teacher_weights = inputs.pop('_mopd_teacher_weights', None)
+        mopd_teacher_ids = inputs.pop('_mopd_teacher_ids', None)  # Backward compatibility for cached batches.
+        inputs.pop('_mopd_hidden_seq_lens', None)
         opsd_teacher_inputs = inputs.pop('_opsd_teacher_inputs', None)
         inputs.pop('_opsd_teacher_messages', None)
 
@@ -386,6 +703,24 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 # Release hidden states after loss computation
                 del student_hidden, teacher_hidden, true_labels
             outputs_student = None
+        # MOPD mode: remote teachers return hidden states; local teacher heads rebuild full-vocab logits.
+        elif self.mopd_enable:
+            assert mopd_teacher_hidden_states is not None
+            assert mopd_teacher_weights is not None or mopd_teacher_ids is not None
+            if self.args.sft_alpha > 0:
+                model_inputs['labels'] = inputs['labels']
+            outputs_student = model(**model_inputs)
+            mopd_teacher_hidden_states = self._apply_logits_to_keep_to_hidden(
+                mopd_teacher_hidden_states, inputs.get('logits_to_keep'))
+            teacher_out = TeacherOutput(
+                hidden_states=mopd_teacher_hidden_states,
+                teacher_ids=mopd_teacher_ids,
+                teacher_weights=mopd_teacher_weights,
+            )
+            loss = self._compute_mopd_loss(outputs_student.logits, teacher_out, inputs['labels'])
+
+            if self.args.sft_alpha > 0 and data_source != DataSource.STUDENT:
+                loss = loss + self.args.sft_alpha * outputs_student.loss
         # Teacher API mode: top-k logprobs fetched from external teacher server
         elif self.use_teacher_api:
             assert teacher_api_logprobs is not None
@@ -629,6 +964,14 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             # Mark data source for downstream processing (e.g., conditional SFT loss)
             encoded_inputs['_data_source'] = data_source
 
+            if self.mopd_enable:
+                if teacher_data is not None:
+                    raise NotImplementedError('MOPD does not support OPSD teacher_prompt data yet.')
+                teacher_hidden, teacher_weights, seq_lens = self._fetch_mopd_hidden_states(encoded_inputs, inputs)
+                encoded_inputs['_mopd_teacher_hidden_states'] = teacher_hidden
+                encoded_inputs['_mopd_teacher_weights'] = teacher_weights
+                encoded_inputs['_mopd_hidden_seq_lens'] = seq_lens
+
             # Fetch teacher logprobs from API if using external teacher service
             if self.use_teacher_api:
                 teacher_logprobs, teacher_indices = self._fetch_teacher_logprobs_from_api(
@@ -825,8 +1168,238 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
         return logprobs_flat.unsqueeze(0).to(device), indices_flat.unsqueeze(0).to(device)
 
+    def _fetch_mopd_hidden_states(self, encoded_inputs: Dict[str, torch.Tensor], raw_inputs: List[Dict[str, Any]]):
+        if self.template.padding_free:
+            raise NotImplementedError('MOPD currently does not support padding-free batches.')
+        if any(raw.get('images') or raw.get('audios') or raw.get('videos') for raw in raw_inputs):
+            raise NotImplementedError('MOPD hidden-state teacher API currently supports text-only batches.')
+
+        sample_teacher_weights = self._get_mopd_sample_teacher_weights(raw_inputs)
+        input_ids = encoded_inputs['input_ids']
+        attention_mask = encoded_inputs.get('attention_mask')
+        position_ids = encoded_inputs.get('text_position_ids')
+        if position_ids is None:
+            position_ids = encoded_inputs.get('position_ids')
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        dtype = self._mopd_dtype(self.mopd_hidden_dtype)
+        hidden_states = {}
+        seq_lens = torch.zeros(batch_size, dtype=torch.long, device=device)
+        teacher_to_indices = defaultdict(list)
+        for idx, weights in enumerate(sample_teacher_weights):
+            for teacher_id in weights:
+                teacher_to_indices[teacher_id].append(idx)
+
+        for teacher_id, indices in teacher_to_indices.items():
+            group_input_ids = input_ids[indices]
+            group_attention_mask = attention_mask[indices] if attention_mask is not None else None
+            group_position_ids = position_ids[indices] if position_ids is not None else None
+            hidden_raw, group_seq_lens = fetch_teacher_hidden_states(
+                self.mopd_teacher_servers[teacher_id],
+                group_input_ids.detach().cpu().tolist(),
+                attention_mask=group_attention_mask.detach().cpu().tolist()
+                if group_attention_mask is not None else None,
+                position_ids=group_position_ids.detach().cpu().tolist() if group_position_ids is not None else None,
+                dtype=self.mopd_hidden_dtype,
+                timeout=self.mopd_request_timeout,
+            )
+            if hidden_raw.ndim != 3:
+                raise ValueError(f'MOPD teacher `{teacher_id}` returned hidden states with rank {hidden_raw.ndim}; '
+                                 'expected [batch, seq_len, hidden_size].')
+            if hidden_raw.shape[0] != len(indices) or hidden_raw.shape[1] != seq_len:
+                raise ValueError(f'MOPD teacher `{teacher_id}` returned hidden shape {tuple(hidden_raw.shape)} for '
+                                 f'input shape {(len(indices), seq_len)}.')
+            hidden_raw = hidden_raw.to(device=device, dtype=dtype)
+            hidden_states[teacher_id] = {'indices': indices, 'hidden_states': hidden_raw}
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+            seq_lens.index_copy_(0, index_tensor, group_seq_lens.to(device=device, dtype=torch.long))
+
+        if not hidden_states:
+            raise ValueError('MOPD received an empty batch.')
+        return hidden_states, sample_teacher_weights, seq_lens
+
+    @staticmethod
+    def _apply_logits_to_keep_to_hidden(hidden_states: Any, logits_to_keep):
+        if isinstance(hidden_states, dict):
+            return {
+                teacher_id: {
+                    **entry,
+                    'hidden_states': GKDTrainer._apply_logits_to_keep_to_hidden(entry['hidden_states'], logits_to_keep)
+                }
+                for teacher_id, entry in hidden_states.items()
+            }
+        if logits_to_keep is None:
+            return hidden_states
+        if isinstance(logits_to_keep, torch.Tensor):
+            if logits_to_keep.dtype == torch.bool:
+                return hidden_states[:, logits_to_keep.to(hidden_states.device)]
+            logits_to_keep = logits_to_keep.item()
+        return hidden_states[:, -int(logits_to_keep):]
+
+    def _compute_mopd_teacher_log_probs(self, teacher_hidden: torch.Tensor,
+                                        teacher_id: str) -> torch.Tensor:
+        weight_cpu, bias_cpu = self._mopd_head_tensors[teacher_id]
+        if teacher_hidden.shape[-1] != weight_cpu.shape[1]:
+            raise ValueError(f'MOPD teacher `{teacher_id}` hidden size {teacher_hidden.shape[-1]} does not match '
+                             f'lm head input size {weight_cpu.shape[1]}.')
+        device = teacher_hidden.device
+        compute_dtype = teacher_hidden.dtype
+        weight = weight_cpu.to(device=device, dtype=compute_dtype, non_blocking=True)
+        bias = bias_cpu.to(device=device, dtype=compute_dtype, non_blocking=True) if bias_cpu is not None else None
+        teacher_logits = F.linear(teacher_hidden.to(dtype=compute_dtype), weight, bias) / self.temperature
+        return F.log_softmax(teacher_logits, dim=-1)
+
+    @staticmethod
+    def _mopd_sample_weights_from_teacher_ids(teacher_ids: List[str]) -> List[Dict[str, float]]:
+        return [{teacher_id: 1.0} for teacher_id in teacher_ids]
+
+    @staticmethod
+    def _build_mopd_hidden_entries(hidden_states, sample_teacher_weights, teacher_ids, device):
+        if isinstance(hidden_states, dict):
+            return hidden_states
+        if teacher_ids is None:
+            teacher_ids = []
+            for weights in sample_teacher_weights:
+                if len(weights) != 1:
+                    raise ValueError('Tensor-form MOPD hidden states require single-teacher sample weights.')
+                teacher_ids.append(next(iter(weights)))
+        entries = {}
+        for teacher_id in dict.fromkeys(teacher_ids):
+            indices = [i for i, current_id in enumerate(teacher_ids) if current_id == teacher_id]
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+            entries[teacher_id] = {
+                'indices': indices,
+                'hidden_states': hidden_states.index_select(0, index_tensor),
+            }
+        return entries
+
+    def _compute_mopd_kl_chunk(self, student_log_probs: torch.Tensor,
+                               mixed_teacher_log_probs: torch.Tensor) -> torch.Tensor:
+        beta = self.beta
+        if beta == 1:
+            return F.kl_div(student_log_probs, mixed_teacher_log_probs, reduction='none', log_target=True).sum()
+        if beta == 0:
+            return F.kl_div(mixed_teacher_log_probs, student_log_probs, reduction='none', log_target=True).sum()
+
+        beta_t = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
+        log_beta = torch.log(beta_t)
+        log_1_minus_beta = torch.log1p(-beta_t)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack([student_log_probs + log_1_minus_beta, mixed_teacher_log_probs + log_beta]),
+            dim=0,
+        )
+        kl_teacher = F.kl_div(mixture_log_probs, mixed_teacher_log_probs, reduction='none', log_target=True)
+        kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction='none', log_target=True)
+        return (beta_t * kl_teacher + (1 - beta_t) * kl_student).sum()
+
+    def _compute_mopd_loss(self, student_logits: torch.Tensor, teacher_output: TeacherOutput,
+                           labels: torch.Tensor) -> torch.Tensor:
+        teacher_output.validate()
+        if not teacher_output.is_hidden_state_mode:
+            raise ValueError('MOPD loss requires teacher hidden states and teacher ids.')
+        if teacher_output.opsd_teacher_labels is not None:
+            raise NotImplementedError('MOPD does not support OPSD teacher prompts yet.')
+
+        hidden_states = teacher_output.hidden_states
+        teacher_ids = teacher_output.teacher_ids
+        if teacher_output.teacher_weights is not None:
+            sample_teacher_weights = teacher_output.teacher_weights
+        elif teacher_ids is not None:
+            sample_teacher_weights = self._mopd_sample_weights_from_teacher_ids(teacher_ids)
+        else:
+            raise ValueError('MOPD loss requires teacher_weights or teacher_ids.')
+        if len(sample_teacher_weights) != student_logits.shape[0]:
+            raise ValueError(f'MOPD teacher weight length {len(sample_teacher_weights)} does not match batch size '
+                             f'{student_logits.shape[0]}.')
+
+        hidden_entries = self._build_mopd_hidden_entries(
+            hidden_states, sample_teacher_weights, teacher_ids, student_logits.device)
+
+        shifted_labels = torch.roll(labels, shifts=-1, dims=1)
+        mask = shifted_labels != -100
+        num_valid = mask.sum()
+        if num_valid == 0:
+            return student_logits.new_zeros(())
+
+        valid_positions = mask.nonzero(as_tuple=False)
+        sample_to_teacher_row = {}
+        for teacher_id, entry in hidden_entries.items():
+            sample_to_teacher_row[teacher_id] = {
+                sample_idx: row_idx
+                for row_idx, sample_idx in enumerate(entry['indices'])
+            }
+            if entry['hidden_states'].shape[0] != len(entry['indices']):
+                raise ValueError(f'MOPD hidden batch size for teacher `{teacher_id}` does not match indices.')
+            if entry['hidden_states'].shape[1] != student_logits.shape[1]:
+                raise ValueError(f'MOPD hidden sequence length for teacher `{teacher_id}` '
+                                 f'{entry["hidden_states"].shape[1]} does not match student '
+                                 f'{student_logits.shape[1]}.')
+
+        total_loss = student_logits.new_zeros(())
+        num_valid_int = num_valid.item()
+        vocab_size = student_logits.shape[-1]
+        for start_idx in range(0, num_valid_int, self.mopd_loss_chunk_size):
+            end_idx = min(start_idx + self.mopd_loss_chunk_size, num_valid_int)
+            chunk_positions = valid_positions[start_idx:end_idx]
+            sample_indices = chunk_positions[:, 0]
+            token_positions = chunk_positions[:, 1]
+            student_chunk = student_logits[sample_indices, token_positions] / self.temperature
+            student_log_probs = F.log_softmax(student_chunk, dim=-1)
+            mixed_teacher_log_probs = student_log_probs.new_full(student_log_probs.shape, float('-inf'))
+
+            for teacher_id, entry in hidden_entries.items():
+                selected_chunk_rows = []
+                selected_teacher_rows = []
+                selected_token_positions = []
+                selected_weights = []
+                lookup = sample_to_teacher_row[teacher_id]
+                for chunk_row, sample_idx in enumerate(sample_indices.tolist()):
+                    weight = sample_teacher_weights[sample_idx].get(teacher_id)
+                    if weight is None:
+                        continue
+                    if sample_idx not in lookup:
+                        raise ValueError(f'MOPD teacher `{teacher_id}` is required by sample {sample_idx} but its '
+                                         'hidden states were not fetched.')
+                    selected_chunk_rows.append(chunk_row)
+                    selected_teacher_rows.append(lookup[sample_idx])
+                    selected_token_positions.append(token_positions[chunk_row].item())
+                    selected_weights.append(weight)
+                if not selected_chunk_rows:
+                    continue
+
+                chunk_row_tensor = torch.tensor(selected_chunk_rows, dtype=torch.long, device=student_logits.device)
+                teacher_row_tensor = torch.tensor(
+                    selected_teacher_rows, dtype=torch.long, device=entry['hidden_states'].device)
+                token_pos_tensor = torch.tensor(
+                    selected_token_positions, dtype=torch.long, device=entry['hidden_states'].device)
+                teacher_hidden = entry['hidden_states'][teacher_row_tensor, token_pos_tensor]
+                if teacher_hidden.shape[-1] != self._mopd_head_tensors[teacher_id][0].shape[1]:
+                    raise ValueError(f'MOPD teacher `{teacher_id}` hidden size {teacher_hidden.shape[-1]} does not '
+                                     f'match lm head input size {self._mopd_head_tensors[teacher_id][0].shape[1]}.')
+                if self._mopd_head_tensors[teacher_id][0].shape[0] != vocab_size:
+                    raise ValueError(f'MOPD teacher `{teacher_id}` vocab size '
+                                     f'{self._mopd_head_tensors[teacher_id][0].shape[0]} does not match student '
+                                     f'vocab size {vocab_size}.')
+                with torch.no_grad():
+                    teacher_log_probs = self._compute_mopd_teacher_log_probs(
+                        teacher_hidden.to(device=student_logits.device, dtype=student_logits.dtype), teacher_id)
+                    log_weights = torch.log(
+                        torch.tensor(selected_weights, dtype=student_logits.dtype, device=student_logits.device))
+                    teacher_term = student_log_probs.new_full(student_log_probs.shape, float('-inf'))
+                    teacher_term[chunk_row_tensor] = teacher_log_probs + log_weights[:, None]
+                    mixed_teacher_log_probs = torch.logaddexp(mixed_teacher_log_probs, teacher_term)
+
+            total_loss = total_loss + self._compute_mopd_kl_chunk(student_log_probs, mixed_teacher_log_probs)
+
+        return total_loss / num_valid
+
     def prediction_step(self, model, inputs, *args, **kwargs):
         encoded_inputs = self._prepare_batch_inputs(inputs, encode_prompt_only=False)
+        if self.mopd_enable:
+            teacher_hidden, teacher_weights, seq_lens = self._fetch_mopd_hidden_states(encoded_inputs, inputs)
+            encoded_inputs['_mopd_teacher_hidden_states'] = teacher_hidden
+            encoded_inputs['_mopd_teacher_weights'] = teacher_weights
+            encoded_inputs['_mopd_hidden_seq_lens'] = seq_lens
         if self.use_teacher_api:
             teacher_logprobs, teacher_indices = self._fetch_teacher_logprobs_from_api(encoded_inputs, raw_inputs=inputs)
             encoded_inputs['_teacher_api_logprobs'] = teacher_logprobs
@@ -1112,6 +1685,101 @@ def _parse_prompt_logprobs(prompt_logprobs_list, topk):
             lps.append(lp_row)
             ixs.append(ix_row)
     return lps, ixs
+
+
+def _torch_load_bytes(content: bytes):
+    buffer = io.BytesIO(content)
+    try:
+        return torch.load(buffer, map_location='cpu', weights_only=True)
+    except TypeError:
+        buffer.seek(0)
+        return torch.load(buffer, map_location='cpu')
+
+
+def _mopd_tensor_from_json(data: Dict[str, Any], dtype: torch.dtype) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    hidden = data.get('hidden_states', data.get('last_hidden_state'))
+    if hidden is None:
+        raise ValueError('MOPD hidden-state response must contain `hidden_states` or `last_hidden_state`.')
+    hidden = torch.tensor(hidden, dtype=dtype)
+    seq_lens = data.get('seq_lens', data.get('sequence_lengths'))
+    if seq_lens is not None:
+        seq_lens = torch.tensor(seq_lens, dtype=torch.long)
+    return hidden, seq_lens
+
+
+def _mopd_tensor_from_response(data, dtype: torch.dtype) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if isinstance(data, torch.Tensor):
+        return data.to(dtype=dtype), None
+    if not isinstance(data, dict):
+        raise ValueError('MOPD hidden-state response must be a tensor or a dict.')
+    hidden = data.get('hidden_states', data.get('last_hidden_state'))
+    if hidden is None:
+        raise ValueError('MOPD hidden-state response dict must contain `hidden_states` or `last_hidden_state`.')
+    if not isinstance(hidden, torch.Tensor):
+        hidden = torch.tensor(hidden, dtype=dtype)
+    else:
+        hidden = hidden.to(dtype=dtype)
+    seq_lens = data.get('seq_lens', data.get('sequence_lengths'))
+    if seq_lens is not None and not isinstance(seq_lens, torch.Tensor):
+        seq_lens = torch.tensor(seq_lens, dtype=torch.long)
+    elif isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.to(dtype=torch.long)
+    return hidden, seq_lens
+
+
+def fetch_teacher_hidden_states(base_url,
+                                input_ids,
+                                attention_mask=None,
+                                position_ids=None,
+                                dtype='bf16',
+                                timeout=300.0):
+    """Fetch final-layer teacher hidden states for MOPD.
+
+    The teacher service should expose ``POST /v1/mopd/hidden_states``. The recommended
+    response format is ``torch.save({'hidden_states': tensor, 'seq_lens': tensor}, bytes)``
+    with ``application/octet-stream`` content type. JSON with a nested ``hidden_states``
+    list is also accepted for tests and small mock servers.
+    """
+    global _teacher_session
+    if _teacher_session is None:
+        _teacher_session = _build_teacher_session()
+    session = _teacher_session
+
+    base_url = base_url.rstrip('/')
+    dtype_mapping = {
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'fp16': torch.float16,
+        'float16': torch.float16,
+        'fp32': torch.float32,
+        'float32': torch.float32,
+    }
+    torch_dtype = dtype_mapping.get(dtype)
+    if torch_dtype is None:
+        raise ValueError(f'Unsupported MOPD hidden dtype: {dtype}')
+
+    payload = {'input_ids': input_ids, 'dtype': dtype}
+    if attention_mask is not None:
+        payload['attention_mask'] = attention_mask
+    if position_ids is not None:
+        payload['position_ids'] = position_ids
+
+    resp = session.post(f'{base_url}/v1/mopd/hidden_states', json=payload, timeout=timeout)
+    resp.raise_for_status()
+    content_type = resp.headers.get('content-type', '')
+    if 'application/json' in content_type:
+        hidden, seq_lens = _mopd_tensor_from_json(resp.json(), torch_dtype)
+    else:
+        hidden, seq_lens = _mopd_tensor_from_response(_torch_load_bytes(resp.content), torch_dtype)
+
+    if hidden.ndim != 3:
+        raise ValueError(f'MOPD hidden states must have shape [batch, seq_len, hidden_size], got {tuple(hidden.shape)}')
+    if seq_lens is None:
+        if attention_mask is not None:
+            seq_lens = torch.tensor([sum(mask) for mask in attention_mask], dtype=torch.long)
+        else:
+            seq_lens = torch.full((len(input_ids), ), hidden.shape[1], dtype=torch.long)
+    return hidden.contiguous(), seq_lens.contiguous()
 
 
 _MM_PLACEHOLDER_PATTERN = re.compile(r'(<image>|<video>|<audio>)')
